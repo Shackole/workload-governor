@@ -15,10 +15,11 @@ export type OrgRecord = {
 
 export type OrgEvent = {
   org_id: string;
-  event_type: 'applied' | 'withdrawn' | 'assigned' | 'completed' | 'revoked';
+  event_type: 'applied' | 'withdrawn' | 'assigned' | 'completed' | 'revoked' | 'maint_reg';
   issue_id: string;
   contributor: string;
   tx_hash: string;
+  event_idx?: number;
   occurred_at: Date;
 };
 
@@ -35,7 +36,7 @@ export function getPool(): Pool {
       connectionString: process.env['DATABASE_URL'],
       // Pool sizing — configurable via environment variables.
       // DB_POOL_MIN: minimum connections kept alive (default 2)
-      // DB_POOL_MAX: maximum connections allowed (default 10)
+      // DB_POOL_MAX: maximum connections allowed (default 20)
       min: parseInt(process.env['DB_POOL_MIN'] ?? '2', 10),
       max: parseInt(process.env['DB_POOL_MAX'] ?? '20', 10),
       idleTimeoutMillis: parseInt(process.env['DB_IDLE_TIMEOUT'] ?? '30000', 10),
@@ -68,7 +69,7 @@ export function getPool(): Pool {
 export const pool = getPool();
 
 // ---------------------------------------------------------------------------
-// Org / Event queries (used by SyncService — issue #310)
+// Org / Event queries (used by SyncService — issue #310 & #1023)
 // ---------------------------------------------------------------------------
 
 /** Query all registered orgs from the database. */
@@ -81,23 +82,57 @@ export async function getRegisteredOrgs(
   return result.rows;
 }
 
-/** Persist a single org event to the database. */
+/**
+ * Persist a single org event to the database using conflict-safe deduplication (#1023).
+ *
+ * Uses `ON CONFLICT (tx_hash, event_idx) DO NOTHING` so parallel ingestion workers
+ * processing adjacent or overlapping ledger batches do not race or insert duplicate rows.
+ */
 export async function saveEvent(
   event: OrgEvent,
   client: Pool | PoolClient = getPool()
 ): Promise<void> {
+  const eventIdx = event.event_idx ?? 0;
   await client.query(
-    `INSERT INTO events (org_id, event_type, issue_id, contributor, tx_hash, occurred_at)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
+    `INSERT INTO events (org_id, event_type, issue_id, contributor, tx_hash, event_idx, occurred_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (tx_hash, event_idx) DO NOTHING`,
     [
       event.org_id,
       event.event_type,
       event.issue_id,
       event.contributor,
       event.tx_hash,
+      eventIdx,
       event.occurred_at,
     ]
   );
+}
+
+/**
+ * Persist an event from a concurrent ingestion worker and return whether it was
+ * newly inserted (`true`) or skipped as a duplicate (`false`) (#1023).
+ */
+export async function saveDeduplicatedEvent(
+  event: OrgEvent,
+  client: Pool | PoolClient = getPool()
+): Promise<boolean> {
+  const eventIdx = event.event_idx ?? 0;
+  const result = await client.query(
+    `INSERT INTO events (org_id, event_type, issue_id, contributor, tx_hash, event_idx, occurred_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (tx_hash, event_idx) DO NOTHING`,
+    [
+      event.org_id,
+      event.event_type,
+      event.issue_id,
+      event.contributor,
+      event.tx_hash,
+      eventIdx,
+      event.occurred_at,
+    ]
+  );
+  return ((result as { rowCount?: number } | undefined)?.rowCount ?? 0) === 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +161,23 @@ export async function healthCheck(): Promise<void> {
  * begins accepting requests.
  */
 export async function migrate(): Promise<void> {
+  const databaseUrl = process.env['DATABASE_URL'];
+  if (!databaseUrl) {
+    throw new Error('DATABASE_URL environment variable is not set');
+  }
+
+  if (typeof pgMigrateRun === 'function') {
+    await pgMigrateRun({
+      databaseUrl,
+      dir: path.join(__dirname, '..', 'migrations'),
+      direction: 'up',
+      migrationsTable: 'pgmigrations',
+      log: () => {
+        // suppress verbose migration logs
+      },
+    });
+  }
+
   await getPool().query(`
     CREATE TABLE IF NOT EXISTS orgs (
       org_id           TEXT PRIMARY KEY,
@@ -140,8 +192,10 @@ export async function migrate(): Promise<void> {
       issue_id    TEXT NOT NULL,
       contributor TEXT NOT NULL,
       tx_hash     TEXT NOT NULL,
+      event_idx   INTEGER NOT NULL DEFAULT 0,
       occurred_at TIMESTAMPTZ NOT NULL,
-      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (tx_hash, event_idx)
     );
 
     CREATE INDEX IF NOT EXISTS idx_events_org_id ON events(org_id);
@@ -290,4 +344,3 @@ export async function closePool(): Promise<void> {
     _pool = null;
   }
 }
-
